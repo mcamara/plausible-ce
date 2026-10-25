@@ -1,0 +1,91 @@
+# Plausible CE at plausible.farnit.com, on the Hetzner server that also runs the
+# portfolio and demolition-derby apps.
+#
+# Rebuilt on 2026-10-25 from the containers that run on the server. The original
+# deploy repo was never pushed. It started from this guide, then changed:
+# https://kyrylo.org/kamal/2024/11/15/how-to-self-host-plausible-analytics-with-kamal.html
+#
+# Do not rename the service or the accessories, and do not change the accessory
+# directories. Kamal derives container names, hostnames, and data paths from them,
+# and a wrong data path boots an empty or stale database.
+service: plausible
+
+image: plausible
+
+servers:
+  web:
+    hosts:
+      - 116.203.58.6
+    # "db createdb" does nothing when the database exists. "db migrate" runs the
+    # pending Postgres and ClickHouse migrations before the app starts.
+    cmd: sh -c "/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run"
+
+# The data lives under this user's home folder, not under /root.
+ssh:
+  user: plausible
+
+proxy:
+  ssl: true
+  host: plausible.farnit.com
+  app_port: 8000
+  healthcheck:
+    # Answers 200 only when Postgres and ClickHouse are reachable.
+    path: /api/health
+
+# Migrations run before the app listens, so the first boot after an upgrade is slow.
+deploy_timeout: 180
+
+# Kamal runs a registry on this machine, and the server pulls through the SSH tunnel.
+registry:
+  server: localhost:5555
+
+builder:
+  arch: amd64
+
+env:
+  clear:
+    BASE_URL: https://plausible.farnit.com
+  secret:
+    - SECRET_KEY_BASE
+    - DATABASE_URL
+    - CLICKHOUSE_DATABASE_URL
+
+accessories:
+  db:
+    image: postgres:18
+    host: 116.203.58.6
+    cmd: postgres -p 5433
+    port: "127.0.0.1:5433:5433"
+    env:
+      clear:
+        POSTGRES_USER: app_user
+        POSTGRES_DB: plausible_db
+        PGPORT: "5433"
+        PORT: "5433"
+      secret:
+        - POSTGRES_PASSWORD
+    directories:
+      # Postgres 18 images keep data in /var/lib/postgresql/18/docker, under this mount.
+      - /home/plausible/plausible-db/data:/var/lib/postgresql
+
+  events-db:
+    image: clickhouse/clickhouse-server:25.12-alpine
+    host: 116.203.58.6
+    # Production publishes 8123 on all interfaces (a firewall blocks it). This value
+    # binds it to localhost and applies only when the accessory is next rebooted.
+    port: "127.0.0.1:8123:8123"
+    env:
+      clear:
+        CLICKHOUSE_USER: app_user
+        CLICKHOUSE_DATABASE: plausible_events_db
+        CLICKHOUSE_PORT: "8123"
+        CLICKHOUSE_PORT_SECURE: "8124"
+      secret:
+        - CLICKHOUSE_PASSWORD
+    directories:
+      - /home/plausible/plausible-events-db/event-data:/var/lib/clickhouse
+      - /home/plausible/plausible-events-db/event-logs:/var/log/clickhouse-server
+    files:
+      - clickhouse/logs.xml:/etc/clickhouse-server/config.d/logs.xml
+      # Binds ClickHouse to IPv4 only, because Docker bridge networks have no IPv6 by default.
+      - clickhouse/ipv4-only.xml:/etc/clickhouse-server/config.d/ipv4-only.xml

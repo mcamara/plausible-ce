@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Upgrade phase 1. The site stays up.
+# 1. Checks that the deploy files are committed. Kamal builds from the committed HEAD.
+# 2. Checks that Kamal can read the secrets from 1Password.
+# 3. Builds the image and copies it to the server.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export SSH_AUTH_SOCK="${SSH_AUTH_SOCK_OVERRIDE:-$HOME/.1password/agent.sock}"
+
+step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+fail() { printf '\n\033[1;31m%s\033[0m\n' "$*"; exit 1; }
+
+step "Check that the deploy files are committed"
+[ -z "$(git status --porcelain -- Dockerfile config clickhouse .gitignore)" ] \
+  || fail "Commit Dockerfile, config/, clickhouse/ and .gitignore first."
+echo "  ok (HEAD $(git rev-parse --short HEAD), $(grep '^FROM' Dockerfile))"
+
+step "Check that Kamal can read the secrets"
+kamal secrets print >/dev/null || fail "Kamal could not read the secrets. Is the 1Password app unlocked?"
+echo "  ok"
+
+step "Build the image and copy it to the server (the site stays up)"
+kamal build deliver
+
+step "Done. The site still runs the old version. Next: bin/upgrade-cutover"

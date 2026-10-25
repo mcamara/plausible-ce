@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Upgrade phase 2. The site is down for a few minutes.
+# 1. Records the running version and the row counts.
+# 2. Stops the app, so that nothing writes to the databases.
+# 3. Dumps Postgres and copies the ClickHouse data folder on the server.
+#    ClickHouse stops while the folder is copied. The Postgres dump is also
+#    copied to this laptop.
+# 4. Deploys the image of the committed HEAD. The new container runs the
+#    migrations, then kamal-proxy sends traffic to it.
+# 5. Prints the health check and the row counts before and after.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+HOST=plausible@116.203.58.6
+STAMP=$(date +%Y%m%d-%H%M%S)
+LOCAL_BACKUPS="$HOME/backups/plausible/$STAMP"
+export SSH_AUTH_SOCK="${SSH_AUTH_SOCK_OVERRIDE:-$HOME/.1password/agent.sock}"
+
+step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+fail() { printf '\n\033[1;31m%s\033[0m\n' "$*"; exit 1; }
+
+counts() {
+  ssh "$HOST" 'bash -s' <<'EOF'
+docker exec plausible-db psql -U app_user -d plausible_db -Atc "select 'sites', count(*) from sites union all select 'users', count(*) from users union all select 'goals', count(*) from goals union all select 'last_migration', max(version) from schema_migrations" | tr '|' ' '
+docker exec plausible-events-db clickhouse-client -q "select table, sum(rows) from system.parts where database = 'plausible_events_db' and active and table in ('events_v2', 'sessions_v2') group by table order by table format TSV" | tr '\t' ' '
+EOF
+}
+
+step "Pre-checks (the site is still up)"
+version=$(git rev-parse HEAD)
+old_version=$(ssh "$HOST" "docker ps --filter label=service=plausible --filter label=role=web --format '{{.Names}}'" | head -1 | sed 's/^plausible-web-//')
+[ -n "$old_version" ] || fail "No running Plausible container. Nothing changed."
+[ "$old_version" != "$version" ] || fail "The server already runs $version. Nothing changed."
+ssh "$HOST" docker image inspect --format '{{.Id}}' "localhost:5555/plausible:$version" >/dev/null \
+  || fail "The image for $version is not on the server. Run bin/upgrade-prepare first."
+kamal secrets print >/dev/null || fail "Kamal could not read the secrets. Nothing changed."
+echo "  running version: $old_version"
+echo "  new version:     $version"
+before=$(counts)
+
+phase="before-deploy"
+on_error() {
+  printf '\n\033[1;31mThe upgrade stopped at the step above.\033[0m\n'
+  case "$phase" in
+    before-deploy)
+      echo "The databases are unchanged. Start the old version again with:"
+      echo "  kamal app start --version $old_version";;
+    deploy)
+      echo "The migrations may have run. Read the logs with 'kamal app logs'."
+      echo "To restore the backups and start the old version:"
+      echo "  bin/upgrade-rollback $STAMP $old_version";;
+  esac
+}
+trap on_error ERR
+
+step "Stop the app (downtime starts)"
+kamal app stop
+
+step "Back up Postgres and ClickHouse on the server (~/backups/$STAMP)"
+ssh "$HOST" "STAMP=$STAMP bash -s" <<'EOF'
+set -euo pipefail
+B="$HOME/backups/$STAMP"
+mkdir -p "$B"
+
+echo "Postgres dump..."
+docker exec plausible-db pg_dump -U app_user -Fc plausible_db > "$B/plausible_db.dump"
+echo "  tables with data in the dump: $(docker exec -i plausible-db pg_restore --list < "$B/plausible_db.dump" | grep -c 'TABLE DATA')"
+
+echo "ClickHouse copy (ClickHouse stops while the folder is copied)..."
+docker stop -t 120 plausible-events-db >/dev/null
+trap 'docker start plausible-events-db >/dev/null' EXIT
+docker run --rm --user 0 --entrypoint sh \
+  -v /home/plausible/plausible-events-db/event-data:/data:ro \
+  -v "$B":/out \
+  "$(docker inspect --format '{{.Config.Image}}' plausible-events-db)" \
+  -c 'tar -cf /out/event-data.tar -C /data . && chown 1000:1000 /out/event-data.tar'
+docker start plausible-events-db >/dev/null
+trap - EXIT
+for i in $(seq 1 60); do
+  docker exec plausible-events-db clickhouse-client -q 'select 1' >/dev/null 2>&1 && break
+  sleep 2
+done
+docker exec plausible-events-db clickhouse-client -q "select 'ClickHouse is back, version ' || version()"
+ls -lh "$B"
+EOF
+
+step "Copy the Postgres dump to this laptop ($LOCAL_BACKUPS)"
+mkdir -p "$LOCAL_BACKUPS"
+scp -q "$HOST:backups/$STAMP/plausible_db.dump" "$LOCAL_BACKUPS/"
+ls -lh "$LOCAL_BACKUPS"
+
+step "Deploy $version (the migrations run first)"
+phase="deploy"
+kamal deploy --skip-push
+trap - ERR
+
+step "Verify"
+echo "Health check:"
+curl -fsS https://plausible.farnit.com/api/health
+echo
+echo "Row counts before:"
+echo "$before" | sed 's/^/  /'
+echo "Row counts after:"
+counts | sed 's/^/  /'
+echo
+echo "Backups: ~/backups/$STAMP on the server, $LOCAL_BACKUPS on this laptop."
+echo "Old version, for bin/upgrade-rollback: $old_version"

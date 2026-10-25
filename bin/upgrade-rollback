@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Rollback for a failed upgrade. Use it only if bin/upgrade-cutover failed
+# during or after the deploy step.
+# 1. Stops the new version if it runs.
+# 2. Restores Postgres from the dump. Moves the current ClickHouse folder aside
+#    (it is kept, not deleted) and restores the copy.
+# 3. Starts the old version again.
+# Usage: bin/upgrade-rollback <stamp> <old version>
+#   Both values are in the output of bin/upgrade-cutover.
+set -euo pipefail
+STAMP="${1:?usage: bin/upgrade-rollback <stamp> <old version>}"
+OLD_VERSION="${2:?usage: bin/upgrade-rollback <stamp> <old version>}"
+cd "$(dirname "$0")/.."
+HOST=plausible@116.203.58.6
+export SSH_AUTH_SOCK="${SSH_AUTH_SOCK_OVERRIDE:-$HOME/.1password/agent.sock}"
+
+step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+
+step "Stop the new version if it runs"
+kamal app stop || true
+
+step "Restore Postgres and ClickHouse from ~/backups/$STAMP"
+ssh "$HOST" "STAMP=$STAMP bash -s" <<'EOF'
+set -euo pipefail
+B="$HOME/backups/$STAMP"
+[ -s "$B/plausible_db.dump" ] && [ -s "$B/event-data.tar" ] || { echo "The backups are missing in $B"; exit 1; }
+
+echo "Postgres restore..."
+docker exec plausible-db psql -U app_user -d postgres -v ON_ERROR_STOP=1 \
+  -c "drop database if exists plausible_db with (force)" \
+  -c "create database plausible_db"
+docker exec -i plausible-db pg_restore -U app_user -d plausible_db --exit-on-error < "$B/plausible_db.dump"
+
+echo "ClickHouse restore (the current folder moves to event-data.failed-$STAMP)..."
+docker stop -t 120 plausible-events-db >/dev/null
+docker run --rm --user 0 --entrypoint sh \
+  -v /home/plausible/plausible-events-db:/ch \
+  -v "$B":/in:ro \
+  "$(docker inspect --format '{{.Config.Image}}' plausible-events-db)" \
+  -c "mv /ch/event-data /ch/event-data.failed-$STAMP && mkdir /ch/event-data && tar -xf /in/event-data.tar -C /ch/event-data"
+docker start plausible-events-db >/dev/null
+for i in $(seq 1 60); do
+  docker exec plausible-events-db clickhouse-client -q 'select 1' >/dev/null 2>&1 && break
+  sleep 2
+done
+docker exec plausible-events-db clickhouse-client -q "select 'ClickHouse is back'"
+EOF
+
+step "Start the old version ($OLD_VERSION)"
+kamal app start --version "$OLD_VERSION"
+curl -fsS https://plausible.farnit.com/api/health
+echo

@@ -7,6 +7,9 @@
 !README.md
 !LICENSE
 !.gitignore
+!AGENTS.md
+!bin/
+!bin/*
 !Dockerfile
 !config/
 !config/deploy.yml
